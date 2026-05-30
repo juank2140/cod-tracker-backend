@@ -68,31 +68,33 @@ function mapearEstado(shopifyOrder) {
   return 'pendiente';
 }
 
-// ── ENVIAR WHATSAPP VIA ULTRAMSG ─────────────────────────
+// ── ENVIAR WHATSAPP VIA WASENDERAPI ──────────────────────
 async function enviarWhatsApp(telefono, mensaje) {
-  if (!process.env.ULTRAMSG_INSTANCE || !process.env.ULTRAMSG_TOKEN) {
-    console.log('⚠️  WhatsApp no configurado — mensaje omitido:', mensaje);
+  if (!process.env.WASENDER_API_KEY) {
+    console.log('⚠️  WhatsApp no configurado — mensaje omitido');
     return null;
   }
 
-  // Limpiar teléfono: solo números, agregar 57 si es colombiano
+  // Formato E.164: +573011779152
   let tel = telefono.replace(/\D/g, '');
   if (tel.startsWith('3') && tel.length === 10) tel = '57' + tel;
-  if (!tel.startsWith('57')) tel = '57' + tel;
+  if (!tel.startsWith('+')) tel = '+' + tel;
 
   try {
     const res = await axios.post(
-      `https://api.ultramsg.com/${process.env.ULTRAMSG_INSTANCE}/messages/chat`,
+      'https://www.wasenderapi.com/api/send-message',
+      { to: tel, text: mensaje },
       {
-        token: process.env.ULTRAMSG_TOKEN,
-        to: tel,
-        body: mensaje,
+        headers: {
+          'Authorization': `Bearer ${process.env.WASENDER_API_KEY}`,
+          'Content-Type': 'application/json',
+        }
       }
     );
-    console.log(`✅ WhatsApp enviado a ${tel}`);
+    console.log(`✅ WhatsApp enviado a ${tel}`, res.data);
     return res.data;
   } catch (e) {
-    console.error('❌ Error WhatsApp:', e.message);
+    console.error('❌ Error WhatsApp:', e.response?.data || e.message);
     return null;
   }
 }
@@ -267,19 +269,27 @@ app.post('/webhook/orders/updated', async (req, res) => {
 });
 
 // ── ENDPOINT: RESPUESTA DE WHATSAPP (confirmación cliente) ──
-// Cuando el cliente responde SÍ, UltraMsg llama este endpoint
+// Cuando el cliente responde SÍ, WasenderAPI llama este endpoint
 app.post('/whatsapp/incoming', async (req, res) => {
   res.status(200).json({ ok: true });
 
-  const { from, body } = req.body || {};
-  if (!from || !body) return;
+  const payload = req.body || {};
+  // WasenderAPI formato: data.messages.messageBody y data.messages.key.remoteJid
+  const messages = payload?.data?.messages;
+  const texto = messages?.messageBody || '';
+  const remoteJid = messages?.key?.remoteJid || '';
+  // Usar cleanedRemoteJid o extraer del remoteJid
+  const cleanedJid = messages?.key?.cleanedRemoteJid || remoteJid;
 
-  const respuesta = body.trim().toLowerCase();
-  const tel = from.replace(/\D/g, '').slice(-10);
+  if (!texto || !cleanedJid) return;
+
+  const respuesta = texto.trim().toLowerCase();
+  // Extraer número limpio: +573011779152 → 3011779152
+  const tel = cleanedJid.replace(/\D/g, '').slice(-10);
 
   console.log(`\n📱 WhatsApp recibido de ${tel}: "${respuesta}"`);
 
-  const esConfirmacion = ['si', 'sí', 'yes', 'ok', 'dale', 'confirmo', '1'].includes(respuesta);
+  const esConfirmacion = ['si', 'sí', 'yes', 'ok', 'dale', 'confirmo', '1', 'si!', 'sí!', 'claro'].includes(respuesta);
   if (!esConfirmacion) return;
 
   try {
@@ -442,7 +452,7 @@ app.listen(PORT, () => {
   console.log(`\n🚀 COD Tracker Backend corriendo en puerto ${PORT}`);
   console.log(`   Shopify store: ${process.env.SHOPIFY_STORE}`);
   console.log(`   Firebase: ${process.env.FIREBASE_DATABASE_URL}`);
-  console.log(`   WhatsApp: ${process.env.ULTRAMSG_INSTANCE ? 'configurado' : 'no configurado'}\n`);
+  console.log(`   WhatsApp: ${process.env.WASENDER_API_KEY ? 'configurado ✅' : 'no configurado'}\n`);
 });
 
 module.exports = app;
