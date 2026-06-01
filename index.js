@@ -63,9 +63,10 @@ function mapearProducto(lineItems) {
 function mapearEstado(shopifyOrder) {
   const financialStatus = shopifyOrder.financial_status;
   const fulfillmentStatus = shopifyOrder.fulfillment_status;
-  if (fulfillmentStatus === 'fulfilled') return 'entregado';
-  if (financialStatus === 'paid') return 'confirmado';
-  return 'pendiente';
+  if (fulfillmentStatus === 'fulfilled') return 'enviado';      // Preparado/Despachado → En camino
+  if (fulfillmentStatus === 'partial') return 'enviado';        // Parcialmente despachado → En camino
+  if (financialStatus === 'paid') return 'confirmado';          // Pagado → Confirmado
+  return 'pendiente';                                           // Todo lo demás → Pendiente
 }
 
 // ── ENVIAR WHATSAPP VIA WASENDERAPI ──────────────────────
@@ -251,18 +252,59 @@ app.post('/webhook/orders/updated', async (req, res) => {
     const [firebaseKey, pedido] = entry;
     const nuevoEstado = mapearEstado(order);
 
-    if (pedido.estado !== nuevoEstado) {
-      const historial = pedido.historial || [];
-      historial.push({ estado: nuevoEstado, fecha: Date.now(), nota: 'Actualizado desde Shopify' });
+    // ── EXTRAER GUÍA Y TRANSPORTADORA DE SHOPIFY ──────────
+    // Effi sube la guía como tracking number en el fulfillment
+    let guia = pedido.guia || '';
+    let transportadora = pedido.transportadora || '';
+    let guiaNueva = false;
 
-      await updateFirebase(`pedidos/${firebaseKey}`, {
-        estado: nuevoEstado,
-        actualizadoEn: Date.now(),
-        historial,
-      });
+    const fulfillments = order.fulfillments || [];
+    if (fulfillments.length > 0) {
+      const lastFulfillment = fulfillments[fulfillments.length - 1];
+      const trackingNumber = lastFulfillment.tracking_number || '';
+      const trackingCompany = lastFulfillment.tracking_company || '';
 
-      console.log(`✅ Estado actualizado: ${pedido.estado} → ${nuevoEstado}`);
+      if (trackingNumber && trackingNumber !== pedido.guia) {
+        guia = trackingNumber;
+        transportadora = trackingCompany || pedido.transportadora || '';
+        guiaNueva = true;
+        console.log(`📦 Guía detectada: ${guia} — ${transportadora}`);
+      }
     }
+
+    // ── ACTUALIZAR FIREBASE ────────────────────────────────
+    const cambios = { actualizadoEn: Date.now() };
+    const historial = pedido.historial || [];
+
+    if (pedido.estado !== nuevoEstado) {
+      cambios.estado = nuevoEstado;
+      historial.push({ estado: nuevoEstado, fecha: Date.now(), nota: guiaNueva ? `Guía ${guia}` : 'Actualizado desde Shopify' });
+      cambios.historial = historial;
+      console.log(`✅ Estado: ${pedido.estado} → ${nuevoEstado}`);
+    }
+
+    if (guiaNueva) {
+      cambios.guia = guia;
+      cambios.transportadora = transportadora;
+    }
+
+    await updateFirebase(`pedidos/${firebaseKey}`, cambios);
+
+    // ── ENVIAR WHATSAPP CON LA GUÍA ────────────────────────
+    if (guiaNueva && pedido.telefono) {
+      const nombre = (pedido.nombre || '').split(' ')[0];
+      const msg =
+        `🚚 *¡Tu pedido va en camino!*\n\n` +
+        `Hola ${nombre}, tu *${pedido.producto}* fue despachado.\n\n` +
+        `📦 *Guía:* ${guia}\n` +
+        `🏢 *Transportadora:* ${transportadora}\n\n` +
+        `Puedes rastrearlo en la página web de ${transportadora}.\n\n` +
+        `_Salud Verde Colombia_`;
+
+      await enviarWhatsApp(pedido.telefono, msg);
+      console.log(`✅ WhatsApp de guía enviado a ${pedido.telefono}`);
+    }
+
   } catch (err) {
     console.error('❌ Error actualizando pedido:', err.message);
   }
