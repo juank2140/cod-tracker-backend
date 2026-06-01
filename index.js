@@ -100,6 +100,49 @@ async function enviarWhatsApp(telefono, mensaje) {
   }
 }
 
+// ── CONSULTAR DROPI ──────────────────────────────────────
+async function consultarDropi(telefono) {
+  try {
+    // Obtener token desde Firebase
+    const config = await getFromFirebase('config');
+    const dropiToken = config?.dropiToken;
+    if (!dropiToken) {
+      console.log('⚠️  Token Dropi no configurado');
+      return null;
+    }
+
+    const tel = telefono.replace(/\D/g, '').slice(-10);
+    const url = `https://api-v2.dropi.co/bff/customers/fingerprint/v2?country_code=CO&user_id=202912&phone=${tel}&months=0`;
+
+    const res = await axios.get(url, {
+      headers: {
+        'X-Authorization': `Bearer ${dropiToken}`,
+        'X-Host': 'co',
+        'Accept': 'application/json',
+        'Referer': 'https://app.dropi.co/',
+      },
+      timeout: 8000,
+    });
+
+    const data = res.data?.data;
+    if (!data?.found) return { found: false, riesgo: 'Sin historial', color: 'gray', tipo: 'Nuevo' };
+
+    const gp = data.global_profile;
+    return {
+      found: true,
+      riesgo: gp.risk_label || 'Sin historial',
+      color: gp.risk_color || 'gray',
+      tipo: gp.buyer_type || 'Nuevo',
+      totalPedidos: gp.lifetime_totals?.orders || 0,
+      entregados: gp.lifetime_totals?.delivered || 0,
+      devueltos: gp.lifetime_totals?.returned || 0,
+    };
+  } catch (e) {
+    console.error('❌ Error consultando Dropi:', e.response?.data || e.message);
+    return null;
+  }
+}
+
 // ── VERIFICAR HMAC DE SHOPIFY ────────────────────────────
 function verificarWebhook(rawBody, hmacHeader) {
   if (!process.env.SHOPIFY_WEBHOOK_SECRET) return true; // Skip en desarrollo
@@ -179,7 +222,14 @@ app.post('/webhook/orders/create', async (req, res) => {
     const estado = mapearEstado(order);
     const id = genId();
 
-    // 3. Crear pedido en Firebase
+    // 3. Consultar Dropi para análisis de riesgo
+    let dropiData = null;
+    if (telefono) {
+      dropiData = await consultarDropi(telefono);
+      if (dropiData) console.log(`🔍 Dropi: ${dropiData.riesgo} — ${dropiData.tipo}`);
+    }
+
+    // 4. Crear pedido en Firebase
     const pedidoCOD = {
       id,
       shopifyOrderId: String(order.id),
@@ -200,12 +250,13 @@ app.post('/webhook/orders/create', async (req, res) => {
       actualizadoEn: Date.now(),
       historial: [{ estado, fecha: Date.now(), nota: 'Pedido creado desde Shopify' }],
       fuente: 'shopify',
+      dropi: dropiData || null,
     };
 
     await writeToFirebase('pedidos', pedidoCOD);
     console.log(`✅ Pedido ${id} guardado en Firebase`);
 
-    // 4. Enviar WhatsApp de confirmación si hay teléfono
+    // 5. Enviar WhatsApp de confirmación si hay teléfono
     if (telefono) {
       const mensaje =
         `Hola ${nombre.split(' ')[0]} 👋\n\n` +
@@ -456,6 +507,28 @@ app.post('/api/retry-confirmation', async (req, res) => {
   } catch (err) {
     console.error('❌ Error en reintentos:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── ENDPOINT: ACTUALIZAR TOKEN DROPI ────────────────────
+app.post('/api/dropi-token', async (req, res) => {
+  const { token } = req.body || {};
+  if (!token || !token.startsWith('eyJ')) {
+    return res.status(400).json({ error: 'Token inválido' });
+  }
+  try {
+    // Decodificar para verificar expiración
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+    const expDate = new Date(payload.exp * 1000);
+    const ahora = new Date();
+    if (expDate < ahora) {
+      return res.status(400).json({ error: 'Token ya expirado', expiro: expDate.toISOString() });
+    }
+    await updateFirebase('config', { dropiToken: token, dropiTokenExp: payload.exp, dropiTokenUpdated: Date.now() });
+    console.log(`✅ Token Dropi actualizado — expira: ${expDate.toLocaleString('es-CO', { timeZone: 'America/Bogota' })}`);
+    res.json({ ok: true, expira: expDate.toLocaleString('es-CO', { timeZone: 'America/Bogota' }), horasRestantes: Math.round((payload.exp - ahora.getTime()/1000) / 3600) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
