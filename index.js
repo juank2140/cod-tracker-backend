@@ -54,9 +54,27 @@ async function getFromFirebase(path) {
 function mapearProducto(lineItems) {
   if (!lineItems || lineItems.length === 0) return 'Producto';
   const item = lineItems[0];
-  const nombre = item.name || item.title || 'Producto';
+  const nombre = item.title || item.name || 'Producto';
+  const variante = item.variant_title || '';
   const qty = item.quantity || 1;
-  return qty > 1 ? `${nombre} x${qty}` : nombre;
+
+  // Construir nombre con variante si existe
+  // Shopify envía variant_title como "x2", "x3", "x4" o "2 frascos", etc.
+  let nombreFinal = nombre;
+  if (variante && variante.toLowerCase() !== 'default title') {
+    // Si la variante ya tiene el formato x2/x3/x4
+    const matchX = variante.match(/x?\s*(\d+)/i);
+    if (matchX) {
+      nombreFinal = `${nombre} x${matchX[1]}`;
+    } else {
+      nombreFinal = `${nombre} · ${variante}`;
+    }
+  } else if (qty > 1) {
+    // Si no hay variante pero compraron más de 1
+    nombreFinal = `${nombre} x${qty}`;
+  }
+
+  return nombreFinal;
 }
 
 // ── MAPEAR ESTADO SHOPIFY → ESTADO COD TRACKER ──────────
@@ -194,6 +212,10 @@ app.post('/webhook/orders/create', async (req, res) => {
 
   const order = req.body;
   console.log(`\n📦 Nuevo pedido Shopify: #${order.order_number} — ${order.email}`);
+  if (order.line_items && order.line_items[0]) {
+    const li = order.line_items[0];
+    console.log(`   → title: "${li.title}" | name: "${li.name}" | variant_title: "${li.variant_title}" | qty: ${li.quantity}`);
+  }
 
   try {
     // 2. Extraer datos del pedido
