@@ -55,14 +55,12 @@ function mapearProducto(lineItems) {
   if (!lineItems || lineItems.length === 0) return 'Producto';
   const item = lineItems[0];
   const nombre = item.title || item.name || 'Producto';
-  const variante = item.variant_title || '';
+  const variante = item.variant_title && item.variant_title !== 'null' ? item.variant_title : '';
   const qty = item.quantity || 1;
 
-  // Construir nombre con variante si existe
-  // Shopify envía variant_title como "x2", "x3", "x4" o "2 frascos", etc.
   let nombreFinal = nombre;
+
   if (variante && variante.toLowerCase() !== 'default title') {
-    // Si la variante ya tiene el formato x2/x3/x4
     const matchX = variante.match(/x?\s*(\d+)/i);
     if (matchX) {
       nombreFinal = `${nombre} x${matchX[1]}`;
@@ -70,8 +68,10 @@ function mapearProducto(lineItems) {
       nombreFinal = `${nombre} · ${variante}`;
     }
   } else if (qty > 1) {
-    // Si no hay variante pero compraron más de 1
     nombreFinal = `${nombre} x${qty}`;
+  } else {
+    // Sin variante y qty 1 → mínimo de despacho es x2
+    nombreFinal = `${nombre} x2`;
   }
 
   return nombreFinal;
