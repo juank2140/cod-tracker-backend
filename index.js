@@ -341,13 +341,36 @@ app.post('/api/rastreo-masivo', async (req, res) => {
   }
 });
 
-// ── PROXY RASTREO INTERRAPIDÍSIMO ───────────────────────
+// ── PROXY RASTREO INTERRAPIDÍSIMO (2 pasos) ─────────────
 app.get('/api/inter/rastrear/:guia', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
   const { guia } = req.params;
+
   try {
-    const url = `https://apicm.interrapidisimo.com/ServiciosTrackingSTE/api/v1/EstadoTracking/ObtenerEstadoTracking?numeroGuia=${guia}`;
-    const response = await axios.get(url, {
+    // Paso 1: Obtener GUID con ConsultarGuias (no requiere auth fuerte)
+    const urlGuia = `https://apicm.interrapidisimo.com/ConsultaGuiasSTE/api/v1/Guias/ConsultarGuias?NumerosGuias=${guia}&tokenRecaptcha=exempt`;
+    let guid = null;
+
+    try {
+      const r1 = await axios.get(urlGuia, {
+        headers: {
+          'Accept': 'application/json, text/plain, */*',
+          'Authorization': 'bb0e8992-7144-4710-8881-806032079a29',
+          'Idaplicacion': '39',
+          'Origin': 'https://siguetuenvio.interrapidisimo.com',
+          'Referer': 'https://siguetuenvio.interrapidisimo.com/',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+        },
+        timeout: 10000,
+      });
+      guid = r1.data?.resultado?.guid;
+    } catch(e) {
+      console.log(`⚠️ ConsultarGuias falló para ${guia}: ${e.response?.status}`);
+    }
+
+    // Paso 2: ObtenerEstadoTracking con el número de guía directamente
+    const urlTracking = `https://apicm.interrapidisimo.com/ServiciosTrackingSTE/api/v1/EstadoTracking/ObtenerEstadoTracking?numeroGuia=${guia}`;
+    const r2 = await axios.get(urlTracking, {
       headers: {
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'es-ES,es;q=0.9',
@@ -355,7 +378,7 @@ app.get('/api/inter/rastrear/:guia', async (req, res) => {
         'Content-Type': 'application/json',
         'Idaplicacion': '39',
         'Origin': 'https://siguetuenvio.interrapidisimo.com',
-        'Referer': 'https://siguetuenvio.interrapidisimo.com/',
+        'Referer': `https://siguetuenvio.interrapidisimo.com/principal/${guid || 'tracking'}`,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
         'Sec-Ch-Ua': '"Chromium";v="148", "Google Chrome";v="148", "Not(A:Brand";v="99"',
         'Sec-Ch-Ua-Mobile': '?0',
@@ -366,11 +389,12 @@ app.get('/api/inter/rastrear/:guia', async (req, res) => {
       },
       timeout: 12000,
     });
-    res.json(response.data);
+
+    res.json(r2.data);
   } catch (e) {
     const status = e.response?.status || 500;
     const msg = e.response?.data || e.message;
-    console.error(`❌ Proxy Inter error ${status} para guía ${guia}:`, msg);
+    console.error(`❌ Inter proxy error ${status} guía ${guia}:`, msg);
     res.status(status).json({ error: true, status, message: msg });
   }
 });
