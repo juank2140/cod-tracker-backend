@@ -162,6 +162,46 @@ async function consultarDropi(telefono) {
 }
 
 // ── RASTREO INTERRAPIDÍSIMO ──────────────────────────────
+const MAPEO_INTER = {
+  'recibimos tu envío':           { estadoCOD: 'enviado',   etiqueta: '📬 Recibimos tu envío' },
+  'recibimos tu envio':           { estadoCOD: 'enviado',   etiqueta: '📬 Recibimos tu envío' },
+  'en bodega de origen':          { estadoCOD: 'enviado',   etiqueta: '🏭 En bodega de origen' },
+  'viajando al destino':          { estadoCOD: 'enviado',   etiqueta: '🚛 Viajando al destino' },
+  'en bodega de destino':         { estadoCOD: 'enviado',   etiqueta: '🏬 En bodega de destino' },
+  'en alistamiento':              { estadoCOD: 'enviado',   etiqueta: '📦 En alistamiento' },
+  'en reparto':                   { estadoCOD: 'enviado',   etiqueta: '🛵 En reparto' },
+  'recoge en oficina':            { estadoCOD: 'enviado',   etiqueta: '🏢 Recoge en oficina' },
+  'primer intento de entrega':    { estadoCOD: 'novedad',   etiqueta: '⚠️ Primer intento de entrega' },
+  'segundo intento de entrega':   { estadoCOD: 'novedad',   etiqueta: '⚠️ Segundo intento de entrega' },
+  'tercer intento de entrega':    { estadoCOD: 'novedad',   etiqueta: '⚠️ Tercer intento de entrega' },
+  'no entregado':                 { estadoCOD: 'novedad',   etiqueta: '❌ No entregado' },
+  'cliente no encontrado':        { estadoCOD: 'novedad',   etiqueta: '⚠️ Cliente no encontrado' },
+  'cliente ausente':              { estadoCOD: 'novedad',   etiqueta: '⚠️ Cliente ausente' },
+  'direccion incorrecta':         { estadoCOD: 'novedad',   etiqueta: '⚠️ Dirección incorrecta' },
+  'dirección incorrecta':         { estadoCOD: 'novedad',   etiqueta: '⚠️ Dirección incorrecta' },
+  'novedad':                      { estadoCOD: 'novedad',   etiqueta: '⚠️ Novedad en entrega' },
+  'entregado':                    { estadoCOD: 'entregado', etiqueta: '✅ Entregado' },
+  'entrega exitosa':              { estadoCOD: 'entregado', etiqueta: '✅ Entrega exitosa' },
+  'devuelto':                     { estadoCOD: 'devuelto',  etiqueta: '↩️ Devuelto' },
+  'devolucion':                   { estadoCOD: 'devuelto',  etiqueta: '↩️ Devolución' },
+  'devolución':                   { estadoCOD: 'devuelto',  etiqueta: '↩️ Devolución' },
+  'en proceso de devolucion':     { estadoCOD: 'devuelto',  etiqueta: '↩️ En proceso de devolución' },
+  'rezago':                       { estadoCOD: 'novedad',   etiqueta: '⚠️ Envío en rezago' },
+  'en rezago':                    { estadoCOD: 'novedad',   etiqueta: '⚠️ Envío en rezago' },
+};
+
+function mapearEstadoInter(nombreEtapa) {
+  if (!nombreEtapa) return null;
+  const key = nombreEtapa.toLowerCase().trim();
+  // Búsqueda exacta primero
+  if (MAPEO_INTER[key]) return MAPEO_INTER[key];
+  // Búsqueda parcial
+  for (const [patron, valor] of Object.entries(MAPEO_INTER)) {
+    if (key.includes(patron) || patron.includes(key)) return valor;
+  }
+  return { estadoCOD: 'enviado', etiqueta: `🚚 ${nombreEtapa}` };
+}
+
 async function rastrearInterrapidisimo(guia) {
   try {
     const url = `https://apicm.interrapidisimo.com/ServiciosTrackingSTE/api/v1/EstadoTracking/ObtenerEstadoTracking?numeroGuia=${guia}`;
@@ -170,39 +210,40 @@ async function rastrearInterrapidisimo(guia) {
         'Accept': 'application/json',
         'Origin': 'https://siguetuenvio.interrapidisimo.com',
         'Referer': 'https://siguetuenvio.interrapidisimo.com/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       },
       timeout: 10000,
     });
 
     if (!res.data?.operacionExitosa || !res.data?.resultado) return null;
 
-    const r = res.data.resultado;
-    // Mapear estado Inter → estado COD Tracker
-    const estadoInter = (r.estadoActual || r.estado || '').toLowerCase();
-    let estadoCOD = null;
-    let novedad = null;
+    const tracking = res.data.resultado.tracking || [];
+    if (tracking.length === 0) return null;
 
-    if (estadoInter.includes('entregado') || estadoInter.includes('entrega exitosa')) {
-      estadoCOD = 'entregado';
-    } else if (estadoInter.includes('devuelto') || estadoInter.includes('devolucion') || estadoInter.includes('devolución')) {
-      estadoCOD = 'devuelto';
-    } else if (estadoInter.includes('novedad') || estadoInter.includes('no entregado') || estadoInter.includes('cliente no')) {
-      estadoCOD = 'novedad';
-      novedad = r.estadoActual || r.descripcion || 'Novedad en transporte';
-    } else if (estadoInter.includes('en ruta') || estadoInter.includes('en transito') || estadoInter.includes('tránsito') || estadoInter.includes('despacho')) {
-      estadoCOD = 'enviado';
-    }
+    // Estado actual = última etapa del array
+    const ultimaEtapa = tracking[tracking.length - 1];
+    const mapeado = mapearEstadoInter(ultimaEtapa.nombreEtapa);
+
+    // Historial completo de etapas
+    const historialInter = tracking.map(e => ({
+      etapa: e.etapa,
+      nombre: e.nombreEtapa,
+      fecha: e.fechaEtapa,
+    }));
 
     return {
-      estadoInter: r.estadoActual || r.estado,
-      estadoCOD,
-      novedad,
-      fechaActualizacion: r.fechaUltimoEvento || r.fecha,
-      ciudad: r.ciudadActual || r.ciudad,
-      descripcion: r.descripcion || r.estadoActual,
+      estadoInter: ultimaEtapa.nombreEtapa,
+      etiqueta: mapeado?.etiqueta || ultimaEtapa.nombreEtapa,
+      estadoCOD: mapeado?.estadoCOD || null,
+      novedad: ['novedad'].includes(mapeado?.estadoCOD) ? ultimaEtapa.nombreEtapa : null,
+      fechaEstimadaEntrega: ultimaEtapa.fechaEstimadaEntrega,
+      ciudadOrigen: res.data.resultado.ciudadBodegaOrigen,
+      ciudadDestino: res.data.resultado.ciudadBodegaDestino,
+      historialInter,
     };
   } catch (e) {
-    if (e.response?.status === 404) return { estadoInter: 'En alistamiento', estadoCOD: null };
+    if (e.response?.status === 404) return { estadoInter: 'En alistamiento', etiqueta: '📦 En alistamiento', estadoCOD: 'enviado' };
+    if (e.response?.status === 401) return null;
     console.error(`❌ Error rastreando guía ${guia}:`, e.message);
     return null;
   }
@@ -297,6 +338,37 @@ app.post('/api/rastreo-masivo', async (req, res) => {
     console.log(`✅ Rastreo masivo completado: ${actualizados} pedidos actualizados`);
   } catch (e) {
     console.error('❌ Error en rastreo masivo:', e.message);
+  }
+});
+
+// ── PROXY RASTREO INTERRAPIDÍSIMO ───────────────────────
+app.get('/api/inter/rastrear/:guia', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const { guia } = req.params;
+  try {
+    const url = `https://apicm.interrapidisimo.com/ServiciosTrackingSTE/api/v1/EstadoTracking/ObtenerEstadoTracking?numeroGuia=${guia}`;
+    const response = await axios.get(url, {
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'es-CO,es;q=0.9',
+        'Origin': 'https://siguetuenvio.interrapidisimo.com',
+        'Referer': 'https://siguetuenvio.interrapidisimo.com/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-site',
+      },
+      timeout: 12000,
+    });
+    res.json(response.data);
+  } catch (e) {
+    const status = e.response?.status || 500;
+    const msg = e.response?.data || e.message;
+    console.error(`❌ Proxy Inter error ${status} para guía ${guia}:`, msg);
+    res.status(status).json({ error: true, status, message: msg });
   }
 });
 
