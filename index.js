@@ -539,7 +539,6 @@ app.post('/api/dropi-token', async (req, res) => {
     return res.status(400).json({ error: 'Token inválido' });
   }
   try {
-    // Decodificar para verificar expiración
     const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
     const expDate = new Date(payload.exp * 1000);
     const ahora = new Date();
@@ -547,10 +546,67 @@ app.post('/api/dropi-token', async (req, res) => {
       return res.status(400).json({ error: 'Token ya expirado', expiro: expDate.toISOString() });
     }
     await updateFirebase('config', { dropiToken: token, dropiTokenExp: payload.exp, dropiTokenUpdated: Date.now() });
-    console.log(`✅ Token Dropi actualizado — expira: ${expDate.toLocaleString('es-CO', { timeZone: 'America/Bogota' })}`);
-    res.json({ ok: true, expira: expDate.toLocaleString('es-CO', { timeZone: 'America/Bogota' }), horasRestantes: Math.round((payload.exp - ahora.getTime()/1000) / 3600) });
+    const horasRestantes = Math.round((payload.exp - ahora.getTime()/1000) / 3600);
+    console.log(`✅ Token Dropi actualizado — expira en ${horasRestantes}h`);
+
+    // Responder inmediatamente
+    res.json({ ok: true, expira: expDate.toLocaleString('es-CO', { timeZone: 'America/Bogota' }), horasRestantes });
+
+    // Rastrear pedidos sin Dropi en segundo plano
+    console.log('🔍 Iniciando rastreo masivo de pedidos sin Dropi...');
+    const pedidos = await getFromFirebase('pedidos');
+    if (!pedidos) return;
+
+    const sinDropi = Object.entries(pedidos).filter(([, p]) =>
+      !p.dropi && p.telefono && ['pendiente','confirmado','enviado','novedad'].includes(p.estado)
+    );
+
+    console.log(`🔍 ${sinDropi.length} pedidos sin análisis Dropi`);
+    let actualizados = 0;
+
+    for (const [firebaseKey, pedido] of sinDropi) {
+      try {
+        // Pausa entre consultas para no saturar la API de Dropi
+        await new Promise(r => setTimeout(r, 400));
+
+        const tel = (pedido.telefono || '').replace(/\D/g, '').slice(-10);
+        if (!tel || tel.length < 10) continue;
+
+        const url = `https://api-v2.dropi.co/bff/customers/fingerprint/v2?country_code=CO&user_id=202912&phone=${tel}&months=0`;
+        const dropiRes = await axios.get(url, {
+          headers: { 'X-Authorization': `Bearer ${token}`, 'X-Host': 'co', 'Accept': 'application/json', 'Referer': 'https://app.dropi.co/' },
+          timeout: 8000,
+        });
+
+        const data = dropiRes.data?.data;
+        let dropiData;
+        if (!data?.found) {
+          dropiData = { found: false, riesgo: 'Sin historial', color: 'gray', tipo: 'Nuevo', totalPedidos: 0, entregados: 0, devueltos: 0 };
+        } else {
+          const gp = data.global_profile;
+          dropiData = {
+            found: true,
+            riesgo: gp.risk_label || 'Sin historial',
+            color: gp.risk_color || 'gray',
+            tipo: gp.buyer_type || 'Nuevo',
+            totalPedidos: gp.lifetime_totals?.orders || 0,
+            entregados: gp.lifetime_totals?.delivered || 0,
+            devueltos: gp.lifetime_totals?.returned || 0,
+          };
+        }
+
+        await updateFirebase(`pedidos/${firebaseKey}`, { dropi: dropiData });
+        actualizados++;
+        console.log(`✅ Dropi ${pedido.nombre}: ${dropiData.riesgo}`);
+      } catch (e) {
+        console.error(`❌ Error consultando Dropi para ${pedido.nombre}:`, e.response?.data || e.message);
+      }
+    }
+
+    console.log(`✅ Rastreo masivo completado: ${actualizados}/${sinDropi.length} pedidos actualizados`);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+    console.error('❌ Error guardando token Dropi:', e.message);
   }
 });
 
