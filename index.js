@@ -161,6 +161,145 @@ async function consultarDropi(telefono) {
   }
 }
 
+// ── RASTREO INTERRAPIDÍSIMO ──────────────────────────────
+async function rastrearInterrapidisimo(guia) {
+  try {
+    const url = `https://apicm.interrapidisimo.com/ServiciosTrackingSTE/api/v1/EstadoTracking/ObtenerEstadoTracking?numeroGuia=${guia}`;
+    const res = await axios.get(url, {
+      headers: {
+        'Accept': 'application/json',
+        'Origin': 'https://siguetuenvio.interrapidisimo.com',
+        'Referer': 'https://siguetuenvio.interrapidisimo.com/',
+      },
+      timeout: 10000,
+    });
+
+    if (!res.data?.operacionExitosa || !res.data?.resultado) return null;
+
+    const r = res.data.resultado;
+    // Mapear estado Inter → estado COD Tracker
+    const estadoInter = (r.estadoActual || r.estado || '').toLowerCase();
+    let estadoCOD = null;
+    let novedad = null;
+
+    if (estadoInter.includes('entregado') || estadoInter.includes('entrega exitosa')) {
+      estadoCOD = 'entregado';
+    } else if (estadoInter.includes('devuelto') || estadoInter.includes('devolucion') || estadoInter.includes('devolución')) {
+      estadoCOD = 'devuelto';
+    } else if (estadoInter.includes('novedad') || estadoInter.includes('no entregado') || estadoInter.includes('cliente no')) {
+      estadoCOD = 'novedad';
+      novedad = r.estadoActual || r.descripcion || 'Novedad en transporte';
+    } else if (estadoInter.includes('en ruta') || estadoInter.includes('en transito') || estadoInter.includes('tránsito') || estadoInter.includes('despacho')) {
+      estadoCOD = 'enviado';
+    }
+
+    return {
+      estadoInter: r.estadoActual || r.estado,
+      estadoCOD,
+      novedad,
+      fechaActualizacion: r.fechaUltimoEvento || r.fecha,
+      ciudad: r.ciudadActual || r.ciudad,
+      descripcion: r.descripcion || r.estadoActual,
+    };
+  } catch (e) {
+    if (e.response?.status === 404) return { estadoInter: 'En alistamiento', estadoCOD: null };
+    console.error(`❌ Error rastreando guía ${guia}:`, e.message);
+    return null;
+  }
+}
+
+// ── ENDPOINT: RASTREAR GUÍA MANUALMENTE ─────────────────
+app.get('/api/rastrear/:guia', async (req, res) => {
+  const { guia } = req.params;
+  const resultado = await rastrearInterrapidisimo(guia);
+  if (!resultado) return res.status(500).json({ error: 'No se pudo rastrear la guía' });
+  res.json({ ok: true, guia, ...resultado });
+});
+
+// ── ENDPOINT: RASTREO MASIVO AUTOMÁTICO ──────────────────
+// Railway puede llamar este endpoint cada hora via cron
+app.post('/api/rastreo-masivo', async (req, res) => {
+  res.json({ ok: true, mensaje: 'Rastreo masivo iniciado en segundo plano' });
+
+  try {
+    const pedidos = await getFromFirebase('pedidos');
+    if (!pedidos) return;
+
+    // Solo pedidos en camino con guía de Interrapidísimo
+    const aRastrear = Object.entries(pedidos).filter(([, p]) =>
+      p.estado === 'enviado' &&
+      p.guia &&
+      (!p.transportadora || p.transportadora.toLowerCase().includes('inter') || p.transportadora.toLowerCase().includes('rapid'))
+    );
+
+    console.log(`\n🚚 Rastreo masivo: ${aRastrear.length} guías de Interrapidísimo`);
+    let actualizados = 0;
+
+    for (const [firebaseKey, pedido] of aRastrear) {
+      try {
+        await new Promise(r => setTimeout(r, 500));
+        const tracking = await rastrearInterrapidisimo(pedido.guia);
+        if (!tracking) continue;
+
+        console.log(`📦 ${pedido.nombre} (${pedido.guia}): ${tracking.estadoInter}`);
+
+        // Solo actualizar si hay cambio de estado relevante
+        if (tracking.estadoCOD && tracking.estadoCOD !== pedido.estado) {
+          const historial = pedido.historial || [];
+          historial.push({
+            estado: tracking.estadoCOD,
+            fecha: Date.now(),
+            nota: `Inter: ${tracking.estadoInter}${tracking.ciudad ? ' — ' + tracking.ciudad : ''}`
+          });
+
+          const cambios = {
+            estado: tracking.estadoCOD,
+            actualizadoEn: Date.now(),
+            historial,
+            ultimoTracking: tracking,
+          };
+
+          if (tracking.novedad) cambios.novedad = tracking.novedad;
+
+          await updateFirebase(`pedidos/${firebaseKey}`, cambios);
+          actualizados++;
+
+          // WhatsApp si fue entregado
+          if (tracking.estadoCOD === 'entregado' && pedido.telefono) {
+            await enviarWhatsApp(pedido.telefono,
+              `✅ *¡Tu pedido fue entregado!*\n\n` +
+              `Hola ${(pedido.nombre||'').split(' ')[0]}, tu *${pedido.producto}* fue entregado exitosamente.\n\n` +
+              `Gracias por tu compra 🙌\n_Salud Verde Colombia_`
+            );
+          }
+
+          // WhatsApp si hay novedad
+          if (tracking.estadoCOD === 'novedad' && pedido.telefono) {
+            await enviarWhatsApp(pedido.telefono,
+              `⚠️ *Novedad en tu pedido*\n\n` +
+              `Hola ${(pedido.nombre||'').split(' ')[0]}, tuvimos una novedad con tu pedido de *${pedido.producto}*:\n\n` +
+              `_${tracking.estadoInter}_\n\n` +
+              `Nuestro equipo te contactará pronto para coordinar la entrega.\n_Salud Verde Colombia_`
+            );
+          }
+        }
+
+        // Guardar último estado de tracking aunque no cambie el estado COD
+        if (tracking.estadoInter) {
+          await updateFirebase(`pedidos/${firebaseKey}`, { ultimoTracking: tracking });
+        }
+
+      } catch (e) {
+        console.error(`❌ Error rastreando ${pedido.guia}:`, e.message);
+      }
+    }
+
+    console.log(`✅ Rastreo masivo completado: ${actualizados} pedidos actualizados`);
+  } catch (e) {
+    console.error('❌ Error en rastreo masivo:', e.message);
+  }
+});
+
 // ── VERIFICAR HMAC DE SHOPIFY ────────────────────────────
 function verificarWebhook(rawBody, hmacHeader) {
   if (!process.env.SHOPIFY_WEBHOOK_SECRET) return true; // Skip en desarrollo
@@ -646,6 +785,47 @@ app.listen(PORT, () => {
   console.log(`   Shopify store: ${process.env.SHOPIFY_STORE}`);
   console.log(`   Firebase: ${process.env.FIREBASE_DATABASE_URL}`);
   console.log(`   WhatsApp: ${process.env.WASENDER_API_KEY ? 'configurado ✅' : 'no configurado'}\n`);
+
+  // Rastreo automático de guías cada hora
+  const HORA = 60 * 60 * 1000;
+  setTimeout(async () => {
+    console.log('⏰ Iniciando rastreo automático cada hora...');
+    const rastreoAutomatico = async () => {
+      try {
+        const pedidos = await getFromFirebase('pedidos');
+        if (!pedidos) return;
+        const aRastrear = Object.entries(pedidos).filter(([, p]) =>
+          p.estado === 'enviado' && p.guia &&
+          (!p.transportadora || p.transportadora.toLowerCase().includes('inter') || p.transportadora.toLowerCase().includes('rapid'))
+        );
+        if (aRastrear.length === 0) return;
+        console.log(`\n⏰ Rastreo automático: ${aRastrear.length} guías`);
+
+        for (const [firebaseKey, pedido] of aRastrear) {
+          await new Promise(r => setTimeout(r, 600));
+          const tracking = await rastrearInterrapidisimo(pedido.guia);
+          if (!tracking?.estadoCOD || tracking.estadoCOD === pedido.estado) continue;
+
+          const historial = pedido.historial || [];
+          historial.push({ estado: tracking.estadoCOD, fecha: Date.now(), nota: `Inter: ${tracking.estadoInter}` });
+          const cambios = { estado: tracking.estadoCOD, actualizadoEn: Date.now(), historial, ultimoTracking: tracking };
+          if (tracking.novedad) cambios.novedad = tracking.novedad;
+          await updateFirebase(`pedidos/${firebaseKey}`, cambios);
+          console.log(`✅ ${pedido.nombre} (${pedido.guia}): ${pedido.estado} → ${tracking.estadoCOD}`);
+
+          if (tracking.estadoCOD === 'entregado' && pedido.telefono) {
+            await enviarWhatsApp(pedido.telefono, `✅ *¡Tu pedido fue entregado!*\n\nHola ${(pedido.nombre||'').split(' ')[0]}, tu *${pedido.producto}* fue entregado exitosamente. ¡Gracias por tu compra! 🙌\n_Salud Verde Colombia_`);
+          }
+          if (tracking.estadoCOD === 'novedad' && pedido.telefono) {
+            await enviarWhatsApp(pedido.telefono, `⚠️ *Novedad en tu pedido*\n\nHola ${(pedido.nombre||'').split(' ')[0]}, tuvimos una novedad con tu *${pedido.producto}*:\n\n_${tracking.estadoInter}_\n\nTe contactamos pronto.\n_Salud Verde Colombia_`);
+          }
+        }
+      } catch (e) { console.error('❌ Error rastreo automático:', e.message); }
+    };
+
+    await rastreoAutomatico();
+    setInterval(rastreoAutomatico, HORA);
+  }, 30000); // Esperar 30s después de arrancar
 });
 
 module.exports = app;
